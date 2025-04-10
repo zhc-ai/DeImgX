@@ -20,10 +20,10 @@ VIDEO_HEIGHT = 1920         # 视频原始高度
 PREVIEW_WIDTH = 360         # 预览窗口宽度（等比例缩放）
 PREVIEW_HEIGHT = int(PREVIEW_WIDTH * VIDEO_HEIGHT / VIDEO_WIDTH)
 FRAME_RATE = 30             # 预览帧率
-ENABLE_CLIP_ATTACK = True   # ✅ 开关：是否启用 CLIP 对抗扰动
-ENABLE_CLIP_SIMILARITY = True  # ✅ 新增开关：是否计算混淆前后在 CLIP 嵌入空间的相似度
-ENABLE_SSIM_FPS_LOG = True  # ✅ 开关：是否打印 SSIM 和 FPS
-ENABLE_PHASH_CHECK = True   # ✅ 开关：是否启用感知哈希检测
+ENABLE_CLIP_ATTACK = False      # ✅ 开关：是否启用 CLIP 对抗扰动
+ENABLE_CLIP_SIMILARITY = True   # ✅ 新增开关：是否计算混淆前后在 CLIP 嵌入空间的相似度
+ENABLE_SSIM_FPS_LOG = True      # ✅ 开关：是否打印 SSIM 和 FPS
+ENABLE_PHASH_CHECK = True       # ✅ 开关：是否启用感知哈希检测
 
 # ========== 初始化设备和模型 ==========
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -59,7 +59,7 @@ def spatial_obfuscation(tensor):
     fft = torch.fft.fft2(tensor)
     fft_shift = torch.fft.fftshift(fft)
     _, _, h, w = fft_shift.shape
-    yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
+    yy, xx = torch.meshgrid(torch.arange(h, device=tensor.device), torch.arange(w, device=tensor.device), indexing='ij')
     center_h, center_w = h // 2, w // 2
     radius = 30
     mask = ((yy - center_h) ** 2 + (xx - center_w) ** 2 >= radius ** 2).float().to(tensor.device)
@@ -156,6 +156,7 @@ class MainApp(QMainWindow):
         self.frame_iter = self.container.decode(self.stream)
         self.last_time = time.time()
         self.frame_count = 0
+        self.orig_embed = None
 
     def read_frame(self):
         try:
@@ -175,17 +176,15 @@ class MainApp(QMainWindow):
             tensor = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
             perturbed = spatial_obfuscation(tensor)
 
-            # 对抗扰动
             if ENABLE_CLIP_ATTACK:
                 resized_tensor = F.interpolate(tensor, size=(224, 224), mode="bilinear", align_corners=False)
                 resized_tensor.requires_grad_(True)
-                orig_embed = model.encode_image(resized_tensor).detach()
-                adv_tensor = clip_adversarial(perturbed.clone(), orig_embed)
+                self.orig_embed = model.encode_image(resized_tensor).detach()
+                adv_tensor = clip_adversarial(perturbed.clone(), self.orig_embed)
                 output_np = (adv_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             else:
                 output_np = (perturbed.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-            # 相似度与帧率输出
             if ENABLE_SSIM_FPS_LOG:
                 ssim = compute_ssim(tensor, perturbed)
                 self.frame_count += 1
@@ -198,11 +197,11 @@ class MainApp(QMainWindow):
                         phash_sim = compute_phash_sim(img, output_np)
                         log += f" | pHash相似度: {phash_sim:.4f}"
 
-                    if ENABLE_CLIP_SIMILARITY:
+                    if ENABLE_CLIP_SIMILARITY and self.orig_embed is not None:
                         clip_out = F.interpolate(torch.from_numpy(output_np).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0,
                                                 size=(224, 224), mode="bilinear", align_corners=False)
                         embed = model.encode_image(clip_out)
-                        cos_sim = F.cosine_similarity(embed, orig_embed, dim=-1).item()
+                        cos_sim = F.cosine_similarity(embed, self.orig_embed, dim=-1).item()
                         log += f" | CLIP相似度: {cos_sim:.4f}"
 
                     print(log)
