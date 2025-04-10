@@ -1,0 +1,14 @@
+torch>=2.1
+torchvision>=0.15
+numpy
+opencv-python
+av
+tqdm
+piq
+Pillow
+scipy
+ftfy
+regex
+obsws-python
+clip @ git+https://github.com/openai/CLIP.git
+
