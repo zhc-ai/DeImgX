@@ -10,6 +10,8 @@ from PyQt5.QtCore import QTimer
 from PyQt5.QtOpenGL import QGLWidget
 from OpenGL.GL import *
 import clip  # ✅ OpenAI 的图文对齐模型 CLIP
+import imagehash  # ✅ 感知哈希
+from PIL import Image
 
 # ========== 配置参数 ==========
 VIDEO_PATH = "sample.mp4"  # 输入视频路径
@@ -18,8 +20,10 @@ VIDEO_HEIGHT = 1920         # 视频原始高度
 PREVIEW_WIDTH = 360         # 预览窗口宽度（等比例缩放）
 PREVIEW_HEIGHT = int(PREVIEW_WIDTH * VIDEO_HEIGHT / VIDEO_WIDTH)
 FRAME_RATE = 30             # 预览帧率
-ENABLE_CLIP_ATTACK = False  # ✅ 开关：是否启用 CLIP 对抗扰动
+ENABLE_CLIP_ATTACK = True   # ✅ 开关：是否启用 CLIP 对抗扰动
+ENABLE_CLIP_SIMILARITY = True  # ✅ 新增开关：是否计算混淆前后在 CLIP 嵌入空间的相似度
 ENABLE_SSIM_FPS_LOG = True  # ✅ 开关：是否打印 SSIM 和 FPS
+ENABLE_PHASH_CHECK = True   # ✅ 开关：是否启用感知哈希检测
 
 # ========== 初始化设备和模型 ==========
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -57,10 +61,10 @@ def spatial_obfuscation(tensor):
     _, _, h, w = fft_shift.shape
     yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
     center_h, center_w = h // 2, w // 2
-    radius = 30  # ⬅️ 更小频率掩码中心半径，扩大高频扰动范围
+    radius = 30
     mask = ((yy - center_h) ** 2 + (xx - center_w) ** 2 >= radius ** 2).float().to(tensor.device)
     mask = mask.unsqueeze(0).unsqueeze(0)
-    noise = (torch.rand_like(fft_shift.real) - 0.5) * 0.6  # ⬅️ 更强扰动幅度
+    noise = (torch.rand_like(fft_shift.real) - 0.5) * 0.6
     fft_shift += (noise + 1j * noise) * mask
     result = torch.fft.ifft2(torch.fft.ifftshift(fft_shift)).real
     return torch.clamp(result, 0, 1)
@@ -76,6 +80,14 @@ def compute_ssim(img1, img2):
     sigma12 = F.avg_pool2d(img1 * img2, 11, 1, 5) - mu1 * mu2
     ssim_map = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1 + sigma2 + C2))
     return ssim_map.mean().item()
+
+# ========== pHash 相似度计算 ==========
+def compute_phash_sim(img1, img2):
+    pil1 = Image.fromarray(cv2.cvtColor(img1, cv2.COLOR_RGB2BGR))
+    pil2 = Image.fromarray(cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))
+    hash1 = imagehash.phash(pil1)
+    hash2 = imagehash.phash(pil2)
+    return 1 - (hash1 - hash2) / len(hash1.hash) ** 2
 
 # ========== OpenGL 预览窗口类 ==========
 class GLPreview(QGLWidget):
@@ -163,22 +175,37 @@ class MainApp(QMainWindow):
             tensor = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
             perturbed = spatial_obfuscation(tensor)
 
+            # 对抗扰动
             if ENABLE_CLIP_ATTACK:
                 resized_tensor = F.interpolate(tensor, size=(224, 224), mode="bilinear", align_corners=False)
                 resized_tensor.requires_grad_(True)
-                orig_embed = model.encode_image(resized_tensor)
+                orig_embed = model.encode_image(resized_tensor).detach()
                 adv_tensor = clip_adversarial(perturbed.clone(), orig_embed)
                 output_np = (adv_tensor.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
             else:
                 output_np = (perturbed.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
+            # 相似度与帧率输出
             if ENABLE_SSIM_FPS_LOG:
                 ssim = compute_ssim(tensor, perturbed)
                 self.frame_count += 1
                 now = time.time()
                 if now - self.last_time >= 1:
                     fps = self.frame_count / (now - self.last_time)
-                    print(f"[实时] FPS: {fps:.2f} | SSIM: {ssim:.4f}")
+                    log = f"[实时] FPS: {fps:.2f} | SSIM: {ssim:.4f}"
+
+                    if ENABLE_PHASH_CHECK:
+                        phash_sim = compute_phash_sim(img, output_np)
+                        log += f" | pHash相似度: {phash_sim:.4f}"
+
+                    if ENABLE_CLIP_SIMILARITY:
+                        clip_out = F.interpolate(torch.from_numpy(output_np).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0,
+                                                size=(224, 224), mode="bilinear", align_corners=False)
+                        embed = model.encode_image(clip_out)
+                        cos_sim = F.cosine_similarity(embed, orig_embed, dim=-1).item()
+                        log += f" | CLIP相似度: {cos_sim:.4f}"
+
+                    print(log)
                     self.last_time = now
                     self.frame_count = 0
 
